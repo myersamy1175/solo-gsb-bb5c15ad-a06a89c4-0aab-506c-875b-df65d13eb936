@@ -29,6 +29,15 @@
 每个节点给出 `total_addresses`，以及自身范围扣除全部直接子节点并集后的
 `exclusive_address_count` 与无损、数量最少的 `exclusive_cidrs`。
 
+`POST /cidrs/diff` 比对 **before / after 两份各 0～500 个带唯一 id 的
+IPv4 网段清单**：按 id 匹配后逐条报告新增（`added`）、删除（`removed`）、
+CIDR 变更（`cidr_changed`）与未变（`unchanged`），并在各自清单内独立
+计算每个网段的**直接父节点**（前缀最长的严格超网），标记父节点变化
+（`parent_changed`）；规范化后**网段相同但 id 不同**的前后条目标记为
+**替换候选**（`replacement_candidates`）。CIDR 变更条目的受影响地址数
+取旧、新网段的**对称差**，新增 / 删除取该网段地址数；结果保持
+**before 顺序**，新增项按 **after 顺序**追加。
+
 `POST /routes/resolve` 则是静态路由解析：给定最多 1000 条路由
 （`cidr` / `next_hop` / `metric`）与最多 500 个唯一目标 IPv4 地址，对每个
 目标先做**最长前缀匹配（LPM）**，再在命中路由中保留**最低 metric** 的全部
@@ -59,6 +68,7 @@ docker compose up --build -d
 - **比较接口：** `POST http://localhost:8000/compare`
 - **解释接口：** `POST http://localhost:8000/explain`
 - **层级接口：** `POST http://localhost:8000/cidrs/hierarchy`
+- **网段清单差异接口：** `POST http://localhost:8000/cidrs/diff`
 - **路由解析接口：** `POST http://localhost:8000/routes/resolve`
 - **故障切换接口：** `POST http://localhost:8000/routes/failover`
 - **交互式文档（Swagger UI）：** http://localhost:8000/docs
@@ -616,6 +626,218 @@ curl -s http://localhost:8000/cidrs/hierarchy \
 
 ---
 
+### `POST /cidrs/diff`
+
+比对 **before / after 两份带唯一 id 的 IPv4 网段清单**，回答“这批网段从
+旧清单到新清单发生了什么变化”。
+
+1. 两侧条目先做严格 IPv4 校验与规范化（纯 IP 按 `/32`），并分别检查
+   **id 唯一**与**规范化后网段唯一**；
+2. 按 **id** 匹配两侧条目，分为 `added` / `removed` / `cidr_changed` /
+   `unchanged` 四类；
+3. 每个条目的**直接父节点**（清单内前缀最长的严格超网，规则与
+   `/cidrs/hierarchy` 相同）在**各自清单内独立**计算；同 id 匹配上的
+   条目比较前后父节点，变化时 `parent_changed = true`（可与
+   `cidr_changed` 同时成立）；新增 / 删除项两侧只有一侧有父节点，
+   `parent_changed` 为 `null`；
+4. 规范化后**网段相同但 id 不同**的前后条目两两配对（两侧网段各自唯一，
+   每个网段至多一对），列入 `replacement_candidates`，提示“同网段换 id”
+   的替换关系；
+5. 受影响地址数 `affected_address_count`：
+   - `cidr_changed`：旧、新网段的**对称差**（`|旧 △ 新| = |旧| + |新| − 2×|交集|`），
+     网段缩小取差值、扩张取增量、互不相交取两者之和；
+   - `added` / `removed`：该网段自身地址数；
+   - `unchanged`：`0`（父节点变化不改变地址集合）。
+
+- `before` / `after`：**各 0～500 个**条目，**允许两侧或任一侧为空** `[]`；
+  条目的 `id` / `cidr` 校验与 `/cidrs/hierarchy` 完全一致
+  （id 为非空字符串或整数；严格 IPv4 CIDR、纯 IP 按 `/32`、主机位必须为
+  零、禁止 IPv6）。
+- 排序：`changes` **保持 before 顺序**（删除项与同 id 匹配项按 before
+  出现位置排列），**新增项按 after 顺序追加**；`replacement_candidates`
+  按 before 侧位置排序。
+- 任一侧 id 或规范化网段重复时返回 **422**，两侧重复问题在同一次响应中
+  分别列出、**不产生任何部分结果**。基于整数区间运算，**不逐地址枚举**。
+
+#### 请求体
+
+```json
+{
+  "before": [
+    {"id": "net",     "cidr": "10.0.0.0/8"},
+    {"id": "sub-a",   "cidr": "10.1.0.0/16"},
+    {"id": "sub-b",   "cidr": "10.2.0.0/16"},
+    {"id": "old-dns", "cidr": "8.8.8.8/32"}
+  ],
+  "after": [
+    {"id": "net",     "cidr": "10.0.0.0/8"},
+    {"id": "sub-a",   "cidr": "10.1.0.0/24"},
+    {"id": "sub-c",   "cidr": "10.2.0.0/16"},
+    {"id": "new-dns", "cidr": "8.8.8.8/32"}
+  ]
+}
+```
+
+#### 响应字段
+
+| 字段 | 说明 |
+| --- | --- |
+| `before_count` / `after_count` | before / after 侧条目数 |
+| `changes[]` | 逐条变化结果：保持 before 顺序（删除 / 匹配项），新增项按 after 顺序追加 |
+| `changes[].id` | 条目 id（两侧共有或仅一侧存在） |
+| `changes[].change` | `added` / `removed` / `cidr_changed` / `unchanged` |
+| `changes[].before_cidr` / `.after_cidr` | before / after 侧规范化网段；缺失侧为 `null` |
+| `changes[].before_parent_id` / `.after_parent_id` | 各自清单内的直接父节点 id（root 为 `null`）；缺失侧为 `null` |
+| `changes[].parent_changed` | 同 id 匹配项的直接父节点是否变化；新增 / 删除项为 `null` |
+| `changes[].affected_address_count` | 受影响地址数：CIDR 变更取旧新对称差，新增 / 删除取该网段地址数，其余为 0 |
+| `replacement_candidates[]` | 规范化后网段相同但 id 不同的配对：`before_id` / `after_id` / `cidr` / `address_count`，按 before 侧位置排序 |
+| `summary.added` / `.removed` / `.cidr_changed` / `.unchanged` | 四类变化各自的条目数（四类之和 = `before_count + added`） |
+| `summary.parent_changed` | 同 id 匹配且父节点变化的条目数（可与 `cidr_changed` 重叠） |
+| `summary.replacement_candidate_count` | 替换候选配对数 |
+| `summary.affected_address_count` | 全部新增、删除与 CIDR 变更条目的受影响地址数之和 |
+
+#### 响应示例（200）
+
+上例中：`net` 未变；`sub-a` 由 `/16` 缩成 `/24`（对称差
+65536 − 256 = 65280）；`sub-b` 被删除、`sub-c` 为新增，二者网段同为
+`10.2.0.0/16` 但 id 不同，构成替换候选；`old-dns` / `new-dns` 同理
+（同一个 `/32` 换了 id）：
+
+```json
+{
+  "before_count": 4,
+  "after_count": 4,
+  "changes": [
+    {
+      "id": "net",
+      "change": "unchanged",
+      "before_cidr": "10.0.0.0/8",
+      "after_cidr": "10.0.0.0/8",
+      "before_parent_id": null,
+      "after_parent_id": null,
+      "parent_changed": false,
+      "affected_address_count": 0
+    },
+    {
+      "id": "sub-a",
+      "change": "cidr_changed",
+      "before_cidr": "10.1.0.0/16",
+      "after_cidr": "10.1.0.0/24",
+      "before_parent_id": "net",
+      "after_parent_id": "net",
+      "parent_changed": false,
+      "affected_address_count": 65280
+    },
+    {
+      "id": "sub-b",
+      "change": "removed",
+      "before_cidr": "10.2.0.0/16",
+      "after_cidr": null,
+      "before_parent_id": "net",
+      "after_parent_id": null,
+      "parent_changed": null,
+      "affected_address_count": 65536
+    },
+    {
+      "id": "old-dns",
+      "change": "removed",
+      "before_cidr": "8.8.8.8/32",
+      "after_cidr": null,
+      "before_parent_id": null,
+      "after_parent_id": null,
+      "parent_changed": null,
+      "affected_address_count": 1
+    },
+    {
+      "id": "sub-c",
+      "change": "added",
+      "before_cidr": null,
+      "after_cidr": "10.2.0.0/16",
+      "before_parent_id": null,
+      "after_parent_id": "net",
+      "parent_changed": null,
+      "affected_address_count": 65536
+    },
+    {
+      "id": "new-dns",
+      "change": "added",
+      "before_cidr": null,
+      "after_cidr": "8.8.8.8/32",
+      "before_parent_id": null,
+      "after_parent_id": null,
+      "parent_changed": null,
+      "affected_address_count": 1
+    }
+  ],
+  "replacement_candidates": [
+    {"before_id": "sub-b", "after_id": "sub-c", "cidr": "10.2.0.0/16", "address_count": 65536},
+    {"before_id": "old-dns", "after_id": "new-dns", "cidr": "8.8.8.8/32", "address_count": 1}
+  ],
+  "summary": {
+    "added": 2,
+    "removed": 2,
+    "cidr_changed": 1,
+    "unchanged": 1,
+    "parent_changed": 0,
+    "replacement_candidate_count": 2,
+    "affected_address_count": 196354
+  }
+}
+```
+
+父节点变化与 CIDR 变更可同时发生：例如删掉中间层 `10.1.0.0/16` 后，
+`host`（`10.1.0.1/32`）网段未变（`change = "unchanged"`），但直接父节点
+由 `sub` 变为 `net`，其 `parent_changed` 为 `true` 且
+`affected_address_count` 为 `0`；若同时修改 `host` 的网段，则该条目
+`change = "cidr_changed"`、`parent_changed = true`，受影响地址数仍按
+旧新网段对称差计算（两个不相交 `/32` 时为 2）。
+
+#### 错误示例（422，两侧重复一次性报告）
+
+任一侧 id 或规范化网段重复均返回 422，`detail.before` / `detail.after`
+分别给出该侧的 `duplicate_ids` / `duplicate_networks`（结构同
+`/cidrs/hierarchy`，无问题一侧为空结构），**不产生部分结果**。下例中
+before 侧 id `x` 重复，after 侧 `y` 与 `z` 规范化后网段相同：
+
+```json
+{
+  "detail": {
+    "error": "duplicate_entries",
+    "before": {
+      "duplicate_ids": [
+        {"id": "x", "indexes": [0, 1]}
+      ],
+      "duplicate_networks": []
+    },
+    "after": {
+      "duplicate_ids": [],
+      "duplicate_networks": [
+        {
+          "cidr": "10.0.0.0/8",
+          "entries": [
+            {"index": 0, "id": "y", "cidr": "10.0.0.0/8"},
+            {"index": 1, "id": "z", "cidr": "10.0.0.0/8"}
+          ]
+        }
+      ]
+    }
+  }
+}
+```
+
+#### curl 示例
+
+```bash
+curl -s http://localhost:8000/cidrs/diff \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "before": [{"id":"a","cidr":"10.0.0.0/8"},{"id":"b","cidr":"8.8.8.8"}],
+    "after":  [{"id":"a","cidr":"10.0.0.0/8"},{"id":"c","cidr":"9.9.9.9"}]
+  }'
+```
+
+---
+
 ### `POST /routes/resolve`
 
 对一组唯一目标 IPv4 地址做静态路由解析。解析规则：
@@ -970,6 +1192,12 @@ curl -s http://localhost:8000/routes/failover \
   类型非法（如 `true`、`1.5`）、**`id` 重复**或**规范化后网段重复**
   （后两者在 `detail.duplicate_ids` / `detail.duplicate_networks` 中列出
   冲突 id 与位置）
+- `/cidrs/diff` 缺少 `before` / `after`、任一侧条目数超过 500、任一侧
+  **`id` 重复**或**规范化后网段重复**：422 明细在
+  `detail.before.duplicate_ids` / `detail.before.duplicate_networks` 与
+  `detail.after.duplicate_ids` / `detail.after.duplicate_networks` 中**两侧
+  分别列出**（无问题一侧为空结构），不产生部分结果；条目字段校验同
+  `/cidrs/hierarchy`（两侧均允许为空 `[]`）
 - `/routes/resolve` 缺少 `routes` / `targets`、路由数超过 1000、目标数不在
   1～500、**目标地址重复**（在 `detail.duplicates` 中列出规范化目标及全部
   出现位置 `indexes`）、`next_hop` / `targets` 不是严格 IPv4 地址
@@ -1003,6 +1231,11 @@ pytest -q
 动作差异、双向分组与全空间压缩，`/explain` 的归因归属、默认项位置、
 不重不漏覆盖，`/cidrs/hierarchy` 的最长前缀超网择父、森林稳定排序、
 独占集合（仅扣直接子节点）、重复 id / 重复网段 422 与 1～500 数量边界，
+`/cidrs/diff` 的新增/删除/CIDR 变更/未变分类与 before 顺序、新增项 after
+顺序追加、父节点在各侧独立择父与 `parent_changed`（含与 CIDR 变更同时
+发生）、对称差受影响地址数（扩张/收缩/不相交）、网段相同但 id 不同的
+替换候选、任一侧重复 id / 网段 422 且两侧一次性报告不产生部分结果、
+两侧为空与各 500 条边界，
 `/routes/resolve` 的最长前缀优先于 metric、同前缀最低 metric 选择、ECMP
 下一跳按输入顺序去重、未命中标记、逐下一跳命中汇总、重复目标 422 与
 数量/metric 边界，`/routes/failover` 的四类影响归类（unchanged /
@@ -1020,9 +1253,9 @@ failover 与“过滤失败下一跳后重新 resolve”的 oracle 交叉验证�
 .
 ├── app/
 │   ├── __init__.py
-│   ├── analyzer.py    # 核心：CIDR 解析、区间差集、最少 CIDR 压缩、规则分析、等价比较、裁决归因与包含层级
+│   ├── analyzer.py    # 核心：CIDR 解析、区间差集、最少 CIDR 压缩、规则分析、等价比较、裁决归因、包含层级与网段清单差异
 │   ├── router.py      # 核心：严格 IPv4 地址校验、最长前缀匹配 + 最低 metric 的 ECMP 路由解析与下一跳故障切换
-│   └── main.py        # FastAPI 应用、请求/响应模型与 /analyze、/compare、/explain、/cidrs/hierarchy、/routes/resolve、/routes/failover 接口
+│   └── main.py        # FastAPI 应用、请求/响应模型与 /analyze、/compare、/explain、/cidrs/hierarchy、/cidrs/diff、/routes/resolve、/routes/failover 接口
 ├── tests/
 │   ├── test_analyzer.py
 │   ├── test_router.py
@@ -1056,6 +1289,15 @@ failover 与“过滤失败下一跳后重新 resolve”的 oracle 交叉验证�
   子节点内，不重复扣除），再走“合并 + 贪心切块”得到数量最少的
   `exclusive_cidrs`；兄弟节点按 `(网络地址, 前缀长度, 输入序号)` 稳定
   排序。全程为区间运算，不逐地址枚举。
+- **清单差异**：`/cidrs/diff` 复用层级接口的条目解析与“最长前缀严格超网
+  择父”逻辑，在 before / after 两侧**分别独立**解析、查重并计算父节点；
+  任一侧存在重复 id 或规范化网段重复时收集两侧问题后一次性抛出
+  （不产生部分结果）。以 id 匹配分类新增 / 删除 / CIDR 变更 / 未变，
+  父节点变化只比较同 id 匹配项（新增 / 删除为 `null`）；CIDR 变更的受
+  影响地址数以闭区间长度计算对称差 `|旧| + |新| − 2×|交集|`，无需展开
+  地址。网段相同但 id 不同的配对通过“after 网段 → 条目”索引在一次 before
+  扫描中得到（两侧网段各自唯一，故每个网段至多一对）。输出先按 before
+  顺序、再追加 after 顺序的新增项，排序不依赖任何哈希遍历次序。
 - **路由解析**：`/routes/resolve` 先把路由 CIDR 解析为 32 位整数区间，
   对每个目标线性扫描，仅以区间包含判断命中，先取前缀长度最大者（LPM），
   再在其中取 metric 最小值并保留全部并列路由；其 next_hop 按 routes 输入

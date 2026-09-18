@@ -3,16 +3,19 @@ from __future__ import annotations
 
 from typing import Literal
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Body, FastAPI, HTTPException
 from pydantic import BaseModel, Field, StrictInt, StrictStr, field_validator
 
 from .analyzer import (
+    CIDR_DIFF_MAX_ENTRIES,
     HIERARCHY_MAX_ENTRIES,
+    CidrDiffInputError,
     HierarchyInputError,
     InvalidCIDRError,
     analyze_rules,
     build_cidr_hierarchy,
     compare_rule_sets,
+    diff_cidr_lists,
     explain_query,
     parse_cidr_v4,
 )
@@ -38,11 +41,13 @@ app = FastAPI(
         "也可通过 /compare 比较两组规则在整个 IPv4 空间上的最终判定是否等价，"
         "通过 /explain 解释一段地址空间由哪条规则或默认动作最终裁决，"
         "通过 /cidrs/hierarchy 分析一组 CIDR 的包含层级（森林）与独占地址，"
+        "通过 /cidrs/diff 比对两份带唯一 id 的网段清单的新增、删除、CIDR "
+        "变更与直接父节点变化（并标记规范化后网段相同但 id 不同的替换候选），"
         "通过 /routes/resolve 对目标地址做最长前缀匹配、最低 metric 的"
         "等价多路径（ECMP）路由解析，或通过 /routes/failover 模拟一组下一跳"
         "失效后的路由切换影响（before/after/impact）。"
     ),
-    version="1.5.0",
+    version="1.6.0",
 )
 
 
@@ -266,6 +271,105 @@ class HierarchyResponse(BaseModel):
 
 
 HierarchyNode.model_rebuild()
+
+
+# ---------- /cidrs/diff ----------
+
+
+class CidrDiffRequest(BaseModel):
+    """网段清单差异请求：before / after 各为 0～500 个含唯一 id 与 cidr 的条目。"""
+
+    before: list[CidrEntry] = Field(
+        ...,
+        max_length=CIDR_DIFF_MAX_ENTRIES,
+        description="变更前的条目列表（允许为空 []）；id 与规范化网段在本侧内必须唯一",
+    )
+    after: list[CidrEntry] = Field(
+        ...,
+        max_length=CIDR_DIFF_MAX_ENTRIES,
+        description="变更后的条目列表（允许为空 []）；id 与规范化网段在本侧内必须唯一",
+    )
+
+
+class CidrReplacementCandidate(BaseModel):
+    before_id: EntryId = Field(..., description="before 侧条目 id")
+    after_id: EntryId = Field(..., description="after 侧条目 id")
+    cidr: str = Field(..., description="两侧规范化后相同的网段")
+    address_count: int = Field(..., description="该网段的地址数")
+
+
+class CidrChangeItem(BaseModel):
+    id: EntryId = Field(..., description="条目 id（before/after 两侧或其中一侧）")
+    change: Literal["added", "removed", "cidr_changed", "unchanged"] = Field(
+        ...,
+        description=(
+            "变化分类：added 仅 after 存在；removed 仅 before 存在；"
+            "cidr_changed 同 id 但规范化网段不同；unchanged 同 id 且网段相同"
+            "（parent_changed 可能同时为 true）"
+        ),
+    )
+    before_cidr: str | None = Field(
+        ..., description="before 侧规范化网段；新增项为 null"
+    )
+    after_cidr: str | None = Field(
+        ..., description="after 侧规范化网段；删除项为 null"
+    )
+    before_parent_id: EntryId | None = Field(
+        ...,
+        description="before 侧的直接父节点 id（前缀最长的严格超网，root 为 null）；新增项为 null",
+    )
+    after_parent_id: EntryId | None = Field(
+        ...,
+        description="after 侧的直接父节点 id（前缀最长的严格超网，root 为 null）；删除项为 null",
+    )
+    parent_changed: bool | None = Field(
+        ...,
+        description=(
+            "同 id 匹配项的直接父节点是否发生变化（仅在本侧清单内独立择父）；"
+            "新增 / 删除项为 null"
+        ),
+    )
+    affected_address_count: int = Field(
+        ...,
+        description=(
+            "受影响地址数：CIDR 变更取旧、新网段的对称差地址数；"
+            "新增 / 删除取该网段地址数；其余为 0"
+        ),
+    )
+
+
+class CidrDiffSummary(BaseModel):
+    added: int = Field(..., description="新增条目数")
+    removed: int = Field(..., description="删除条目数")
+    cidr_changed: int = Field(..., description="同 id 但 CIDR 变更的条目数")
+    unchanged: int = Field(
+        ...,
+        description="同 id 且网段相同的条目数（其中部分可能 parent_changed=true）",
+    )
+    parent_changed: int = Field(
+        ...,
+        description="同 id 匹配且直接父节点发生变化的条目数（可与 cidr_changed 重叠）"
+    )
+    replacement_candidate_count: int = Field(
+        ..., description="替换候选（网段相同但 id 不同）的配对数"
+    )
+    affected_address_count: int = Field(
+        ..., description="全部新增、删除与 CIDR 变更条目的受影响地址数之和"
+    )
+
+
+class CidrDiffResponse(BaseModel):
+    before_count: int = Field(..., description="before 侧条目数")
+    after_count: int = Field(..., description="after 侧条目数")
+    changes: list[CidrChangeItem] = Field(
+        ...,
+        description="逐条变化结果：保持 before 顺序（删除 / 匹配项），新增项按 after 顺序追加",
+    )
+    replacement_candidates: list[CidrReplacementCandidate] = Field(
+        ...,
+        description="规范化后网段相同但 id 不同的配对（替换候选），按 before 侧位置排序",
+    )
+    summary: CidrDiffSummary
 
 
 # ---------- /routes/resolve ----------
@@ -557,6 +661,202 @@ def cidr_hierarchy(request: HierarchyRequest) -> dict:
                 "error": "duplicate_entries",
                 "duplicate_ids": exc.duplicate_ids,
                 "duplicate_networks": exc.duplicate_networks,
+            },
+        ) from exc
+    except InvalidCIDRError:
+        # 正常情况下 pydantic 已在入口拦截，这里兜底转为 422
+        raise
+
+
+@app.post(
+    "/cidrs/diff",
+    response_model=CidrDiffResponse,
+    tags=["hierarchy"],
+    summary="比对两份带唯一 id 的 IPv4 网段清单的新增、删除、CIDR 变更与父节点变化",
+    responses={
+        200: {
+            "content": {
+                "application/json": {
+                    "examples": {
+                        "diff": {
+                            "summary": "新增 / 删除 / CIDR 变更 / 父节点变化 / 替换候选",
+                            "value": {
+                                "before_count": 4,
+                                "after_count": 4,
+                                "changes": [
+                                    {
+                                        "id": "net",
+                                        "change": "unchanged",
+                                        "before_cidr": "10.0.0.0/8",
+                                        "after_cidr": "10.0.0.0/8",
+                                        "before_parent_id": None,
+                                        "after_parent_id": None,
+                                        "parent_changed": False,
+                                        "affected_address_count": 0,
+                                    },
+                                    {
+                                        "id": "sub-a",
+                                        "change": "cidr_changed",
+                                        "before_cidr": "10.1.0.0/16",
+                                        "after_cidr": "10.1.0.0/24",
+                                        "before_parent_id": "net",
+                                        "after_parent_id": "net",
+                                        "parent_changed": False,
+                                        "affected_address_count": 65280,
+                                    },
+                                    {
+                                        "id": "sub-b",
+                                        "change": "removed",
+                                        "before_cidr": "10.2.0.0/16",
+                                        "after_cidr": None,
+                                        "before_parent_id": "net",
+                                        "after_parent_id": None,
+                                        "parent_changed": None,
+                                        "affected_address_count": 65536,
+                                    },
+                                    {
+                                        "id": "old-dns",
+                                        "change": "removed",
+                                        "before_cidr": "8.8.8.8/32",
+                                        "after_cidr": None,
+                                        "before_parent_id": None,
+                                        "after_parent_id": None,
+                                        "parent_changed": None,
+                                        "affected_address_count": 1,
+                                    },
+                                    {
+                                        "id": "sub-c",
+                                        "change": "added",
+                                        "before_cidr": None,
+                                        "after_cidr": "10.2.0.0/16",
+                                        "before_parent_id": None,
+                                        "after_parent_id": "net",
+                                        "parent_changed": None,
+                                        "affected_address_count": 65536,
+                                    },
+                                    {
+                                        "id": "new-dns",
+                                        "change": "added",
+                                        "before_cidr": None,
+                                        "after_cidr": "8.8.8.8/32",
+                                        "before_parent_id": None,
+                                        "after_parent_id": None,
+                                        "parent_changed": None,
+                                        "affected_address_count": 1,
+                                    },
+                                ],
+                                "replacement_candidates": [
+                                    {
+                                        "before_id": "sub-b",
+                                        "after_id": "sub-c",
+                                        "cidr": "10.2.0.0/16",
+                                        "address_count": 65536,
+                                    },
+                                    {
+                                        "before_id": "old-dns",
+                                        "after_id": "new-dns",
+                                        "cidr": "8.8.8.8/32",
+                                        "address_count": 1,
+                                    },
+                                ],
+                                "summary": {
+                                    "added": 2,
+                                    "removed": 2,
+                                    "cidr_changed": 1,
+                                    "unchanged": 1,
+                                    "parent_changed": 0,
+                                    "replacement_candidate_count": 2,
+                                    "affected_address_count": 196354,
+                                },
+                            },
+                        }
+                    }
+                }
+            }
+        },
+        422: {
+            "content": {
+                "application/json": {
+                    "examples": {
+                        "duplicates": {
+                            "summary": "after 侧存在重复 id",
+                            "value": {
+                                "detail": {
+                                    "error": "duplicate_entries",
+                                    "before": {
+                                        "duplicate_ids": [],
+                                        "duplicate_networks": [],
+                                    },
+                                    "after": {
+                                        "duplicate_ids": [
+                                            {"id": "x", "indexes": [0, 2]}
+                                        ],
+                                        "duplicate_networks": [],
+                                    },
+                                }
+                            },
+                        }
+                    }
+                }
+            }
+        },
+    },
+)
+def cidr_diff(
+    request: CidrDiffRequest = Body(
+        ...,
+        openapi_examples={
+            "diff": {
+                "summary": "新增 / 删除 / CIDR 变更 / 父节点变化 / 替换候选",
+                "value": {
+                    "before": [
+                        {"id": "net", "cidr": "10.0.0.0/8"},
+                        {"id": "sub-a", "cidr": "10.1.0.0/16"},
+                        {"id": "sub-b", "cidr": "10.2.0.0/16"},
+                        {"id": "old-dns", "cidr": "8.8.8.8/32"},
+                    ],
+                    "after": [
+                        {"id": "net", "cidr": "10.0.0.0/8"},
+                        {"id": "sub-a", "cidr": "10.1.0.0/24"},
+                        {"id": "sub-c", "cidr": "10.2.0.0/16"},
+                        {"id": "new-dns", "cidr": "8.8.8.8/32"},
+                    ],
+                },
+            }
+        },
+    ),
+) -> dict:
+    """按 **id** 匹配 before / after 两份清单并逐条报告差异。
+
+    - ``change`` 分类：``added``（仅 after）、``removed``（仅 before）、
+      ``cidr_changed``（同 id 但规范化网段不同）、``unchanged``（同 id 且
+      网段相同）；
+    - 每个条目的直接父节点（前缀最长的严格超网）在**各自清单内独立**
+      计算，``parent_changed`` 标记同 id 条目的父节点变化（可与
+      ``cidr_changed`` 同时出现；新增 / 删除项为 ``null``）；
+    - 规范化后**网段相同但 id 不同**的前后条目两两配对，列入
+      ``replacement_candidates``（替换候选）；
+    - ``affected_address_count``：CIDR 变更取旧、新网段的**对称差**地址数，
+      新增 / 删除取该网段地址数，其余为 0；
+    - ``changes`` 保持 **before 顺序**（删除 / 匹配项），新增项按
+      **after 顺序**追加。
+
+    任一侧 id 或规范化网段重复时返回 **422**，两侧重复问题一次性报告、
+    **不产生部分结果**；两侧均允许为空（``[]``），单侧最多 500 个条目。
+    """
+    try:
+        return diff_cidr_lists(
+            [(entry.id, entry.cidr) for entry in request.before],
+            [(entry.id, entry.cidr) for entry in request.after],
+        )
+    except CidrDiffInputError as exc:
+        # 任一侧重复 id / 规范化后重复网段：422 并一次性列出两侧冲突
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "duplicate_entries",
+                "before": exc.sides["before"],
+                "after": exc.sides["after"],
             },
         ) from exc
     except InvalidCIDRError:
