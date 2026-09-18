@@ -5,7 +5,9 @@ import pytest
 from ipaddress import IPv4Address, IPv4Network, collapse_addresses, ip_network
 
 from app.analyzer import (
+    DIFF_MAX_ENTRIES,
     HIERARCHY_MAX_ENTRIES,
+    DiffInputError,
     HierarchyInputError,
     InvalidCIDRError,
     V4_SPACE,
@@ -14,6 +16,7 @@ from app.analyzer import (
     build_decision_intervals,
     compare_rule_sets,
     compress_intervals,
+    diff_cidr_lists,
     explain_query,
     merge_intervals,
     parse_cidr_v4,
@@ -862,3 +865,365 @@ def test_hierarchy_random_oracle():
                 check_order(n["children"])
 
         check_order(result["roots"])
+
+
+# ---------- CIDR 清单差异（diff_cidr_lists） ----------
+
+
+def test_diff_all_change_types_and_ordering():
+    """五类条目齐全：顺序 = before 顺序（删除/变更/父变化）+ after 顺序（新增）。"""
+    before = [
+        ("net", "10.0.0.0/8"),        # unchanged（CIDR 与父节点都不变）
+        ("sub", "10.1.0.0/16"),       # removed
+        ("leaf", "10.1.0.0/24"),      # parent_changed：sub 删除后父节点变为 net
+        ("gone", "192.168.0.0/16"),   # removed（与 alias 构成替换候选）
+        ("moved", "172.16.0.0/16"),   # cidr_changed -> 172.16.0.0/24
+    ]
+    after = [
+        ("net", "10.0.0.0/8"),
+        ("leaf", "10.1.0.0/24"),
+        ("moved", "172.16.0.0/24"),
+        ("fresh", "8.8.8.0/24"),      # added
+        ("alias", "192.168.0.0/16"),  # added（与 gone 构成替换候选）
+    ]
+    result = diff_cidr_lists(before, after)
+    assert result["before_count"] == 5
+    assert result["after_count"] == 5
+
+    changes = result["changes"]
+    assert [c["id"] for c in changes] == [
+        "sub", "leaf", "gone", "moved", "fresh", "alias",
+    ]
+    assert [c["change"] for c in changes] == [
+        "removed", "parent_changed", "removed", "cidr_changed", "added", "added",
+    ]
+
+    sub, leaf, gone, moved, fresh, alias = changes
+    assert sub["before_cidr"] == "10.1.0.0/16"
+    assert sub["after_cidr"] is None
+    assert sub["before_parent_id"] == "net"
+    assert sub["after_parent_id"] is None
+    assert sub["affected_addresses"] == 1 << 16
+
+    # 网段未变，仅直接父节点变化 -> 受影响地址数为 0
+    assert leaf["before_cidr"] == leaf["after_cidr"] == "10.1.0.0/24"
+    assert leaf["before_parent_id"] == "sub"
+    assert leaf["after_parent_id"] == "net"
+    assert leaf["affected_addresses"] == 0
+
+    assert gone["affected_addresses"] == 1 << 16
+    # 对称差：|/16| + |/24| - 2 * |交集| = 65536 + 256 - 512
+    assert moved["affected_addresses"] == (1 << 16) + (1 << 8) - 2 * (1 << 8)
+    assert moved["before_parent_id"] is None
+    assert moved["after_parent_id"] is None
+
+    assert fresh["before_cidr"] is None
+    assert fresh["after_cidr"] == "8.8.8.0/24"
+    assert fresh["affected_addresses"] == 1 << 8
+    assert alias["affected_addresses"] == 1 << 16
+
+    # 规范化后网段相同但 id 不同 -> 替换候选
+    assert result["replacement_candidates"] == [
+        {"before_id": "gone", "after_id": "alias", "cidr": "192.168.0.0/16"}
+    ]
+    assert result["summary"] == {
+        "added": 2,
+        "removed": 2,
+        "cidr_changed": 1,
+        "parent_changed": 1,
+        "unchanged": 1,
+    }
+
+
+def test_diff_symmetric_difference_variants():
+    # 不相交：对称差 = 两者地址数之和
+    result = diff_cidr_lists(
+        [("x", "10.0.0.0/16")], [("x", "10.1.0.0/16")]
+    )
+    assert result["changes"][0]["affected_addresses"] == 2 * (1 << 16)
+
+    # 扩大：/24 -> /16，对称差 = 65536 - 256
+    result = diff_cidr_lists(
+        [("x", "10.0.0.0/24")], [("x", "10.0.0.0/16")]
+    )
+    assert result["changes"][0]["affected_addresses"] == (1 << 16) - (1 << 8)
+
+    # 缩小：/8 -> /32，对称差 = 2^24 - 1
+    result = diff_cidr_lists([("x", "10.0.0.0/8")], [("x", "10.0.0.0")])
+    change = result["changes"][0]
+    assert change["after_cidr"] == "10.0.0.0/32"
+    assert change["affected_addresses"] == (1 << 24) - 1
+
+    # 半重叠：10.0.0.0/24 vs 10.0.0.128/25 -> 256 + 128 - 2*128 = 128
+    result = diff_cidr_lists(
+        [("x", "10.0.0.0/24")], [("x", "10.0.0.128/25")]
+    )
+    assert result["changes"][0]["affected_addresses"] == 128
+
+
+def test_diff_empty_lists():
+    # 两侧皆空：合法，无变更
+    assert diff_cidr_lists([], []) == {
+        "before_count": 0,
+        "after_count": 0,
+        "changes": [],
+        "replacement_candidates": [],
+        "summary": {
+            "added": 0,
+            "removed": 0,
+            "cidr_changed": 0,
+            "parent_changed": 0,
+            "unchanged": 0,
+        },
+    }
+
+    # before 为空：全部按 after 顺序新增
+    result = diff_cidr_lists([], [("b", "10.1.0.0/16"), ("a", "10.0.0.0/8")])
+    assert [c["id"] for c in result["changes"]] == ["b", "a"]
+    assert [c["change"] for c in result["changes"]] == ["added", "added"]
+    # 新增项的父节点按 after 清单计算
+    assert result["changes"][0]["after_parent_id"] == "a"
+    assert result["changes"][1]["after_parent_id"] is None
+    assert result["summary"]["added"] == 2
+
+    # after 为空：全部按 before 顺序删除
+    result = diff_cidr_lists([("a", "10.0.0.0/8"), ("b", "10.1.0.0/16")], [])
+    assert [c["id"] for c in result["changes"]] == ["a", "b"]
+    assert [c["change"] for c in result["changes"]] == ["removed", "removed"]
+    assert result["changes"][1]["before_parent_id"] == "a"
+    assert result["summary"]["removed"] == 2
+
+
+def test_diff_parent_change_on_insert_and_remove():
+    # 中间层插入：leaf 的父节点 net -> mid
+    result = diff_cidr_lists(
+        [("net", "10.0.0.0/8"), ("leaf", "10.1.0.0/24")],
+        [("net", "10.0.0.0/8"), ("mid", "10.1.0.0/16"), ("leaf", "10.1.0.0/24")],
+    )
+    changes = {c["id"]: c for c in result["changes"]}
+    assert changes["leaf"]["change"] == "parent_changed"
+    assert changes["leaf"]["before_parent_id"] == "net"
+    assert changes["leaf"]["after_parent_id"] == "mid"
+    assert changes["leaf"]["affected_addresses"] == 0
+    assert changes["mid"]["change"] == "added"
+    assert changes["mid"]["after_parent_id"] == "net"
+    assert result["summary"] == {
+        "added": 1,
+        "removed": 0,
+        "cidr_changed": 0,
+        "parent_changed": 1,
+        "unchanged": 1,
+    }
+
+    # 父节点被删除：leaf 变为根（parent -> None）
+    result = diff_cidr_lists(
+        [("net", "10.0.0.0/8"), ("leaf", "10.1.0.0/24")],
+        [("leaf", "10.1.0.0/24")],
+    )
+    changes = {c["id"]: c for c in result["changes"]}
+    assert changes["leaf"]["change"] == "parent_changed"
+    assert changes["leaf"]["before_parent_id"] == "net"
+    assert changes["leaf"]["after_parent_id"] is None
+    assert changes["net"]["change"] == "removed"
+
+
+def test_diff_replacement_candidates():
+    # 同 id 同网段 -> unchanged，不是替换候选
+    result = diff_cidr_lists([("a", "10.0.0.0/8")], [("a", "10.0.0.0/8")])
+    assert result["changes"] == []
+    assert result["replacement_candidates"] == []
+    assert result["summary"]["unchanged"] == 1
+
+    # 多个候选按 before 输入顺序；候选同时仍计为 removed + added
+    result = diff_cidr_lists(
+        [("x", "10.0.0.0/8"), ("y", "11.0.0.0/8"), ("z", "12.0.0.0/8")],
+        [("p", "11.0.0.0/8"), ("q", "13.0.0.0/8"), ("z", "12.0.0.0/8")],
+    )
+    # z 同 id 同网段 -> unchanged；y->p 为替换候选；x 删除、q 新增
+    assert result["replacement_candidates"] == [
+        {"before_id": "y", "after_id": "p", "cidr": "11.0.0.0/8"}
+    ]
+    assert result["summary"]["removed"] == 2
+    assert result["summary"]["added"] == 2
+    assert result["summary"]["unchanged"] == 1
+
+    # 同网段换了 id，同时该 id 本身也发生了 CIDR 变更：仍是替换候选
+    result = diff_cidr_lists(
+        [("a", "10.0.0.0/8")],
+        [("a", "11.0.0.0/8"), ("b", "10.0.0.0/8")],
+    )
+    assert result["replacement_candidates"] == [
+        {"before_id": "a", "after_id": "b", "cidr": "10.0.0.0/8"}
+    ]
+    assert [c["change"] for c in result["changes"]] == ["cidr_changed", "added"]
+
+
+def test_diff_integer_ids_and_normalization():
+    # 整数 id 与 CIDR 规范化（纯 IP -> /32、前导零前缀归一）
+    result = diff_cidr_lists(
+        [(1, "10.0.0.0/8"), (2, "8.8.8.8")],
+        [(2, "8.8.8.8/32"), (3, "10.0.0.0/08")],
+    )
+    changes = {c["id"]: c for c in result["changes"]}
+    assert changes[1]["change"] == "removed"
+    assert changes[3]["change"] == "added"
+    assert changes[3]["after_cidr"] == "10.0.0.0/8"
+    assert result["summary"]["unchanged"] == 1
+    # 网段 10.0.0.0/8 换了 id：1 -> 3
+    assert result["replacement_candidates"] == [
+        {"before_id": 1, "after_id": 3, "cidr": "10.0.0.0/8"}
+    ]
+
+
+def test_diff_duplicate_entries_raise_per_side():
+    # before 侧重复 id
+    with pytest.raises(DiffInputError) as exc:
+        diff_cidr_lists(
+            [("a", "10.0.0.0/8"), ("a", "11.0.0.0/8")],
+            [("b", "12.0.0.0/8")],
+        )
+    assert set(exc.value.sides) == {"before"}
+    assert exc.value.sides["before"]["duplicate_ids"] == [
+        {"id": "a", "indexes": [0, 1]}
+    ]
+    assert exc.value.sides["before"]["duplicate_networks"] == []
+
+    # after 侧规范化后网段重复
+    with pytest.raises(DiffInputError) as exc:
+        diff_cidr_lists(
+            [("a", "10.0.0.0/8")],
+            [("b", "10.0.0.0/8"), ("c", "10.0.0.0/08")],
+        )
+    assert set(exc.value.sides) == {"after"}
+    assert exc.value.sides["after"]["duplicate_ids"] == []
+    assert len(exc.value.sides["after"]["duplicate_networks"]) == 1
+
+    # 两侧同时有问题：一次报出，不产生部分结果
+    with pytest.raises(DiffInputError) as exc:
+        diff_cidr_lists(
+            [("a", "10.0.0.0/8"), ("a", "10.0.0.0/8")],
+            [("b", "11.0.0.0/8"), ("b", "12.0.0.0/8")],
+        )
+    assert set(exc.value.sides) == {"before", "after"}
+    assert exc.value.sides["before"]["duplicate_ids"] == [
+        {"id": "a", "indexes": [0, 1]}
+    ]
+    assert exc.value.sides["before"]["duplicate_networks"][0]["cidr"] == "10.0.0.0/8"
+    assert exc.value.sides["after"]["duplicate_ids"] == [
+        {"id": "b", "indexes": [0, 1]}
+    ]
+
+
+def test_diff_rejects_invalid_inputs():
+    # 数量超限（任一侧）
+    too_many = [(i, f"1.0.{i // 256}.{i % 256}/32") for i in range(DIFF_MAX_ENTRIES + 1)]
+    with pytest.raises(ValueError):
+        diff_cidr_lists(too_many, [])
+    with pytest.raises(ValueError):
+        diff_cidr_lists([], too_many)
+    # 边界：恰好 500 条合法
+    ok = [(i, f"1.0.{i // 256}.{i % 256}/32") for i in range(DIFF_MAX_ENTRIES)]
+    assert diff_cidr_lists(ok, [])["before_count"] == DIFF_MAX_ENTRIES
+
+    # 非法 id / 非法 CIDR / IPv6（与其他接口同一套校验）
+    with pytest.raises(ValueError):
+        diff_cidr_lists([(True, "10.0.0.0/8")], [])
+    with pytest.raises(ValueError):
+        diff_cidr_lists([], [("  ", "10.0.0.0/8")])
+    with pytest.raises(InvalidCIDRError):
+        diff_cidr_lists([("a", "10.0.0.1/8")], [])
+    with pytest.raises(InvalidCIDRError):
+        diff_cidr_lists([], [("a", "2001:db8::/32")])
+
+
+def test_diff_random_oracle():
+    """与 ipaddress 暴力 oracle 对比：分类、父节点、对称差、顺序与替换候选。"""
+    rng = random.Random(20260918)
+    base = ip_network("10.0.0.0/24")
+    pool = [
+        net
+        for prefixlen in range(26, 31)
+        for net in base.subnets(new_prefix=prefixlen)
+    ] + [ip_network("192.168.0.0/24"), ip_network("192.168.1.0/24")]
+
+    def oracle_parents(entries):
+        parents = {}
+        for eid, net in entries:
+            supers = [
+                (other.prefixlen, other_id)
+                for other_id, other in entries
+                if other_id != eid and other.supernet_of(net)
+            ]
+            parents[eid] = max(supers)[1] if supers else None
+        return parents
+
+    for _ in range(200):
+        # 从共享 id 池中抽样，保证两侧有交集；同侧 id 唯一
+        id_pool = rng.sample(range(1000), k=rng.randint(0, 14))
+        split = rng.randint(0, len(id_pool))
+        before_ids = id_pool[:split]
+        after_ids = id_pool[rng.randint(0, split):] if split else []
+        before = [(i, str(rng.choice(pool))) for i in before_ids]
+        after = [(i, str(rng.choice(pool))) for i in after_ids]
+        # 去掉同侧规范化后重复的网段（合法输入前提）
+        before = list({c: (i, c) for i, c in reversed(before)}.values())[::-1]
+        after = list({c: (i, c) for i, c in reversed(after)}.values())[::-1]
+
+        result = diff_cidr_lists(before, after)
+
+        before_map = {i: ip_network(c) for i, c in before}
+        after_map = {i: ip_network(c) for i, c in after}
+        before_parents = oracle_parents(list(before_map.items()))
+        after_parents = oracle_parents(list(after_map.items()))
+
+        # 期望的变更列表：before 顺序，再追加 after 顺序的新增
+        expected_changes = []
+        expected_summary = {
+            "added": 0, "removed": 0, "cidr_changed": 0,
+            "parent_changed": 0, "unchanged": 0,
+        }
+        for eid, _ in before:
+            if eid not in after_map:
+                kind = "removed"
+                affected = before_map[eid].num_addresses
+            elif before_map[eid] != after_map[eid]:
+                kind = "cidr_changed"
+                affected = len(set(before_map[eid]) ^ set(after_map[eid]))
+            elif before_parents[eid] != after_parents[eid]:
+                kind = "parent_changed"
+                affected = 0
+            else:
+                expected_summary["unchanged"] += 1
+                continue
+            expected_summary[kind] += 1
+            expected_changes.append((eid, kind, affected))
+        for eid, _ in after:
+            if eid in before_map:
+                continue
+            expected_summary["added"] += 1
+            expected_changes.append((eid, "added", after_map[eid].num_addresses))
+
+        got = [(c["id"], c["change"], c["affected_addresses"]) for c in result["changes"]]
+        assert got == expected_changes
+        assert result["summary"] == expected_summary
+
+        # 父节点字段与 oracle 一致
+        for change in result["changes"]:
+            eid = change["id"]
+            assert change["before_parent_id"] == (
+                before_parents[eid] if eid in before_map else None
+            )
+            assert change["after_parent_id"] == (
+                after_parents[eid] if eid in after_map else None
+            )
+
+        # 替换候选：同规范化网段、不同 id，按 before 顺序
+        after_by_cidr = {str(net): i for i, net in after_map.items()}
+        expected_candidates = [
+            {"before_id": i, "after_id": after_by_cidr[str(net)], "cidr": str(net)}
+            for i, net in before_map.items()
+            if str(net) in after_by_cidr and after_by_cidr[str(net)] != i
+        ]
+        assert result["replacement_candidates"] == expected_candidates
+        assert result["before_count"] == len(before)
+        assert result["after_count"] == len(after)

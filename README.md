@@ -29,6 +29,13 @@
 每个节点给出 `total_addresses`，以及自身范围扣除全部直接子节点并集后的
 `exclusive_address_count` 与无损、数量最少的 `exclusive_cidrs`。
 
+`POST /cidrs/diff` 比较 **before / after 两份带唯一 id 的 CIDR 清单**
+（各 0～500 条）：按 id 匹配后报告 **新增 (added)**、**删除 (removed)**、
+**CIDR 变更 (cidr_changed)** 与 **直接父节点变化 (parent_changed)**；
+规范化后网段相同但 id 不同的条目对列入 `replacement_candidates`。
+受影响地址数：CIDR 变更取旧新网段的**对称差**，新增/删除取该网段地址数；
+`changes` 保持 before 顺序，新增项按 after 顺序追加。
+
 `POST /routes/resolve` 则是静态路由解析：给定最多 1000 条路由
 （`cidr` / `next_hop` / `metric`）与最多 500 个唯一目标 IPv4 地址，对每个
 目标先做**最长前缀匹配（LPM）**，再在命中路由中保留**最低 metric** 的全部
@@ -59,6 +66,7 @@ docker compose up --build -d
 - **比较接口：** `POST http://localhost:8000/compare`
 - **解释接口：** `POST http://localhost:8000/explain`
 - **层级接口：** `POST http://localhost:8000/cidrs/hierarchy`
+- **差异接口：** `POST http://localhost:8000/cidrs/diff`
 - **路由解析接口：** `POST http://localhost:8000/routes/resolve`
 - **故障切换接口：** `POST http://localhost:8000/routes/failover`
 - **交互式文档（Swagger UI）：** http://localhost:8000/docs
@@ -616,6 +624,189 @@ curl -s http://localhost:8000/cidrs/hierarchy \
 
 ---
 
+### `POST /cidrs/diff`
+
+比较 **before / after 两份带唯一 `id` 的 IPv4 CIDR 清单**（各 0～500 条，
+允许为空），按 id 匹配后报告条目级差异：
+
+| `change` | 含义 | `affected_addresses` |
+| --- | --- | --- |
+| `added` | 仅存在于 after | 该网段地址数 |
+| `removed` | 仅存在于 before | 该网段地址数 |
+| `cidr_changed` | 同 id 但规范化 CIDR 不同 | 旧新网段的**对称差**地址数（相交部分不计） |
+| `parent_changed` | 同 id 同 CIDR，但**直接父节点**变化 | 0（网段本身未变） |
+
+- **直接父节点**在各自清单内独立计算，规则与 `/cidrs/hierarchy` 一致
+  （前缀最长的严格超网）；中间层插入/删除都会导致子条目的父节点变化。
+- **规范化后网段相同但 id 不同**的条目对列入 `replacement_candidates`
+  （按 before 输入顺序）——同一网段换了 id 的典型场景；这些条目仍按
+  id 匹配规则计入 `removed` / `added`。
+- `changes` 保持 **before 输入顺序**，新增项按 **after 输入顺序**追加；
+  完全不变的条目（`unchanged`）不出现在 `changes` 中，仅计入 `summary`。
+- 任一侧 **id 重复**或**规范化后网段重复**时返回 **422** 并在
+  `detail.before` / `detail.after` 中分别列出该侧冲突，**不产生部分结果**。
+- `id` / `cidr` 校验与 `/cidrs/hierarchy` 完全一致（id 为非空字符串或
+  整数；严格 IPv4 CIDR、纯 IP 按 `/32`、主机位必须为零、禁止 IPv6）。
+
+#### 请求体
+
+```json
+{
+  "before": [
+    {"id": "net",   "cidr": "10.0.0.0/8"},
+    {"id": "sub",   "cidr": "10.1.0.0/16"},
+    {"id": "leaf",  "cidr": "10.1.0.0/24"},
+    {"id": "gone",  "cidr": "192.168.0.0/16"},
+    {"id": "moved", "cidr": "172.16.0.0/16"}
+  ],
+  "after": [
+    {"id": "net",   "cidr": "10.0.0.0/8"},
+    {"id": "leaf",  "cidr": "10.1.0.0/24"},
+    {"id": "moved", "cidr": "172.16.0.0/24"},
+    {"id": "fresh", "cidr": "8.8.8.0/24"},
+    {"id": "alias", "cidr": "192.168.0.0/16"}
+  ]
+}
+```
+
+- `before` / `after`：**必填**，各 0～500 个 `{id, cidr}` 条目；
+  每侧 id 与规范化网段各自唯一。
+
+#### 响应字段
+
+| 字段 | 说明 |
+| --- | --- |
+| `before_count` / `after_count` | 两侧条目数 |
+| `changes[]` | 变更列表，**保持 before 顺序，新增项按 after 顺序追加** |
+| `changes[].id` / `.change` | 条目 id 与变更分类（见上表） |
+| `changes[].before_cidr` / `.after_cidr` | 两侧规范化 CIDR；新增项 `before_cidr` 为 `null`，删除项 `after_cidr` 为 `null` |
+| `changes[].before_parent_id` / `.after_parent_id` | 各自清单内的直接父节点 id；无父节点或该侧不存在时为 `null` |
+| `changes[].affected_addresses` | 受影响地址数（见上表） |
+| `replacement_candidates[]` | 规范化网段相同但 id 不同的条目对（`before_id` / `after_id` / `cidr`），按 before 顺序 |
+| `summary` | 五类条目计数：`added` / `removed` / `cidr_changed` / `parent_changed` / `unchanged` |
+
+#### 响应示例（200）
+
+上例中：`sub` 被删除导致 `leaf` 的直接父节点从 `sub` 变为 `net`
+（`parent_changed`，网段未变、受影响地址数为 0）；`moved` 从 `/16` 收缩为
+`/24`，受影响地址数为对称差 65536 + 256 − 2×256 = 65280；`gone` 与
+`alias` 网段相同但 id 不同，列入替换候选：
+
+```json
+{
+  "before_count": 5,
+  "after_count": 5,
+  "changes": [
+    {
+      "id": "sub",
+      "change": "removed",
+      "before_cidr": "10.1.0.0/16",
+      "after_cidr": null,
+      "before_parent_id": "net",
+      "after_parent_id": null,
+      "affected_addresses": 65536
+    },
+    {
+      "id": "leaf",
+      "change": "parent_changed",
+      "before_cidr": "10.1.0.0/24",
+      "after_cidr": "10.1.0.0/24",
+      "before_parent_id": "sub",
+      "after_parent_id": "net",
+      "affected_addresses": 0
+    },
+    {
+      "id": "gone",
+      "change": "removed",
+      "before_cidr": "192.168.0.0/16",
+      "after_cidr": null,
+      "before_parent_id": null,
+      "after_parent_id": null,
+      "affected_addresses": 65536
+    },
+    {
+      "id": "moved",
+      "change": "cidr_changed",
+      "before_cidr": "172.16.0.0/16",
+      "after_cidr": "172.16.0.0/24",
+      "before_parent_id": null,
+      "after_parent_id": null,
+      "affected_addresses": 65280
+    },
+    {
+      "id": "fresh",
+      "change": "added",
+      "before_cidr": null,
+      "after_cidr": "8.8.8.0/24",
+      "before_parent_id": null,
+      "after_parent_id": null,
+      "affected_addresses": 256
+    },
+    {
+      "id": "alias",
+      "change": "added",
+      "before_cidr": null,
+      "after_cidr": "192.168.0.0/16",
+      "before_parent_id": null,
+      "after_parent_id": null,
+      "affected_addresses": 65536
+    }
+  ],
+  "replacement_candidates": [
+    {"before_id": "gone", "after_id": "alias", "cidr": "192.168.0.0/16"}
+  ],
+  "summary": {
+    "added": 2,
+    "removed": 2,
+    "cidr_changed": 1,
+    "parent_changed": 1,
+    "unchanged": 1
+  }
+}
+```
+
+#### 错误示例（422，任一侧存在重复）
+
+任一侧 id 或规范化网段重复时整体拒绝（不产生部分结果），
+`detail.before` / `detail.after` 仅包含有问题的一侧：
+
+```json
+{
+  "detail": {
+    "error": "duplicate_entries",
+    "before": {
+      "duplicate_ids": [{"id": "a", "indexes": [0, 1]}],
+      "duplicate_networks": []
+    },
+    "after": {
+      "duplicate_ids": [],
+      "duplicate_networks": [
+        {
+          "cidr": "11.0.0.0/8",
+          "entries": [
+            {"index": 0, "id": "b", "cidr": "11.0.0.0/8"},
+            {"index": 1, "id": "c", "cidr": "11.0.0.0/8"}
+          ]
+        }
+      ]
+    }
+  }
+}
+```
+
+#### curl 示例
+
+```bash
+curl -s http://localhost:8000/cidrs/diff \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "before": [{"id":"net","cidr":"10.0.0.0/8"},{"id":"sub","cidr":"10.1.0.0/16"}],
+    "after":  [{"id":"net","cidr":"10.0.0.0/8"},{"id":"sub","cidr":"10.1.0.0/24"}]
+  }'
+```
+
+---
+
 ### `POST /routes/resolve`
 
 对一组唯一目标 IPv4 地址做静态路由解析。解析规则：
@@ -970,6 +1161,9 @@ curl -s http://localhost:8000/routes/failover \
   类型非法（如 `true`、`1.5`）、**`id` 重复**或**规范化后网段重复**
   （后两者在 `detail.duplicate_ids` / `detail.duplicate_networks` 中列出
   冲突 id 与位置）
+- `/cidrs/diff` 缺少 `before` / `after`、任一侧条目数超过 500、任一侧
+  **`id` 重复**或**规范化后网段重复**（在 `detail.before` / `detail.after`
+  中分别列出该侧的 `duplicate_ids` / `duplicate_networks`，不产生部分结果）
 - `/routes/resolve` 缺少 `routes` / `targets`、路由数超过 1000、目标数不在
   1～500、**目标地址重复**（在 `detail.duplicates` 中列出规范化目标及全部
   出现位置 `indexes`）、`next_hop` / `targets` 不是严格 IPv4 地址
@@ -1003,6 +1197,9 @@ pytest -q
 动作差异、双向分组与全空间压缩，`/explain` 的归因归属、默认项位置、
 不重不漏覆盖，`/cidrs/hierarchy` 的最长前缀超网择父、森林稳定排序、
 独占集合（仅扣直接子节点）、重复 id / 重复网段 422 与 1～500 数量边界，
+`/cidrs/diff` 的新增/删除/CIDR 变更/父节点变化分类、对称差地址计数、
+before 顺序 + after 追加顺序、替换候选、任一侧重复 422（不产生部分结果）
+与每侧 0～500 数量边界，
 `/routes/resolve` 的最长前缀优先于 metric、同前缀最低 metric 选择、ECMP
 下一跳按输入顺序去重、未命中标记、逐下一跳命中汇总、重复目标 422 与
 数量/metric 边界，`/routes/failover` 的四类影响归类（unchanged /
@@ -1010,7 +1207,8 @@ ecmp_reduced / rerouted / unreachable）、回退到更高 metric 与更短前�
 失败下一跳整体移除其全部路由、重复失败下一跳 422 与数量边界，
 以及用标准库 `ipaddress.collapse_addresses` 作为 oracle
 的随机属性测试（无损 + 最少块，并与逐地址暴力判定/逐路由暴力 LPM 对比；
-failover 与“过滤失败下一跳后重新 resolve”的 oracle 交叉验证）。
+failover 与“过滤失败下一跳后重新 resolve”的 oracle 交叉验证；
+diff 与基于 `ipaddress` 的暴力分类/父节点/对称差 oracle 交叉验证）。
 
 ---
 
@@ -1020,9 +1218,9 @@ failover 与“过滤失败下一跳后重新 resolve”的 oracle 交叉验证�
 .
 ├── app/
 │   ├── __init__.py
-│   ├── analyzer.py    # 核心：CIDR 解析、区间差集、最少 CIDR 压缩、规则分析、等价比较、裁决归因与包含层级
+│   ├── analyzer.py    # 核心：CIDR 解析、区间差集、最少 CIDR 压缩、规则分析、等价比较、裁决归因、包含层级与清单差异
 │   ├── router.py      # 核心：严格 IPv4 地址校验、最长前缀匹配 + 最低 metric 的 ECMP 路由解析与下一跳故障切换
-│   └── main.py        # FastAPI 应用、请求/响应模型与 /analyze、/compare、/explain、/cidrs/hierarchy、/routes/resolve、/routes/failover 接口
+│   └── main.py        # FastAPI 应用、请求/响应模型与 /analyze、/compare、/explain、/cidrs/hierarchy、/cidrs/diff、/routes/resolve、/routes/failover 接口
 ├── tests/
 │   ├── test_analyzer.py
 │   ├── test_router.py
@@ -1056,6 +1254,13 @@ failover 与“过滤失败下一跳后重新 resolve”的 oracle 交叉验证�
   子节点内，不重复扣除），再走“合并 + 贪心切块”得到数量最少的
   `exclusive_cidrs`；兄弟节点按 `(网络地址, 前缀长度, 输入序号)` 稳定
   排序。全程为区间运算，不逐地址枚举。
+- **清单差异**：`/cidrs/diff` 先完整校验两侧 id 与规范化网段的唯一性
+  （任一侧有问题即整体 422，不产生部分结果），再为每侧独立计算直接父
+  节点（前缀最长的严格超网，与层级接口同一规则）。按 id 匹配：仅一侧
+  存在为新增/删除，同 id 不同 CIDR 为变更（受影响地址数 = 旧新网段区间
+  的对称差，只做整数区间求交，不逐地址枚举），同 id 同 CIDR 但父节点 id
+  不同为父节点变化（受影响地址数为 0）；结果保持 before 顺序、新增项按
+  after 顺序追加，同网段不同 id 的条目对单列为替换候选。
 - **路由解析**：`/routes/resolve` 先把路由 CIDR 解析为 32 位整数区间，
   对每个目标线性扫描，仅以区间包含判断命中，先取前缀长度最大者（LPM），
   再在其中取 metric 最小值并保留全部并列路由；其 next_hop 按 routes 输入

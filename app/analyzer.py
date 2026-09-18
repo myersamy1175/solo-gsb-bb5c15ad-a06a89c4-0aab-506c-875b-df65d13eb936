@@ -59,6 +59,29 @@ class HierarchyInputError(ValueError):
         super().__init__("；".join(parts) or "层级分析输入不合法")
 
 
+class DiffInputError(ValueError):
+    """差异分析输入不合法：任一侧存在重复 id 或规范化后重复的网段。
+
+    ``sides`` 仅包含有问题的一侧，形如
+    ``{"before": {"duplicate_ids": [...], "duplicate_networks": [...]}}``，
+    内部结构与 :class:`HierarchyInputError` 的对应字段一致。
+    """
+
+    def __init__(self, sides: dict) -> None:
+        self.sides = sides
+        parts = []
+        for side, problem in sides.items():
+            kinds = []
+            if problem["duplicate_ids"]:
+                kinds.append(f"{len(problem['duplicate_ids'])} 个重复 id")
+            if problem["duplicate_networks"]:
+                kinds.append(
+                    f"{len(problem['duplicate_networks'])} 个规范化后重复的网段"
+                )
+            parts.append(f"{side} 侧存在{'、'.join(kinds)}")
+        super().__init__("；".join(parts) or "差异分析输入不合法")
+
+
 def normalize_action(action: object) -> str:
     """规范化动作：去空白、转小写；非 allow/deny 抛出 ValueError。"""
     if not isinstance(action, str):
@@ -396,14 +419,24 @@ def compare_rule_sets(
     return {"equivalent": not groups, "differences": groups}
 
 
-# ---------- CIDR 包含层级（/cidrs/hierarchy） ----------
+# ---------- CIDR 包含层级（/cidrs/hierarchy）与清单差异（/cidrs/diff） ----------
 
 #: 层级分析允许的最大条目数
 HIERARCHY_MAX_ENTRIES = 500
 
+#: 差异分析每侧允许的最大条目数
+DIFF_MAX_ENTRIES = HIERARCHY_MAX_ENTRIES
 
-def _validate_hierarchy_id(raw_id: object) -> object:
-    """校验单个层级条目的 id：仅接受非空字符串或非 bool 整数。
+#: 差异分析的变更分类
+ADDED = "added"
+REMOVED = "removed"
+CIDR_CHANGED = "cidr_changed"
+PARENT_CHANGED = "parent_changed"
+UNCHANGED = "unchanged"
+
+
+def _validate_entry_id(raw_id: object) -> object:
+    """校验单个条目的 id：仅接受非空字符串或非 bool 整数。
 
     字符串仅做首尾空白检查（不做截断）；bool 是 int 的子类，明确拒绝。
     """
@@ -412,6 +445,94 @@ def _validate_hierarchy_id(raw_id: object) -> object:
     if isinstance(raw_id, str) and not raw_id.strip():
         raise ValueError("id 不能为空字符串")
     return raw_id
+
+
+def _parse_entries(entries: Sequence[tuple[object, str]]) -> list[dict]:
+    """解析 ``(id, cidr)`` 条目列表为节点字典（保持输入顺序）。
+
+    只做 id 与 CIDR 校验，不做数量与重复检查（由调用方负责）。
+    """
+    nodes: list[dict] = []
+    for index, (raw_id, raw_cidr) in enumerate(entries):
+        entry_id = _validate_entry_id(raw_id)
+        start, end, cidr = parse_cidr_v4(raw_cidr)
+        prefixlen = int(cidr.rsplit("/", 1)[1])
+        nodes.append(
+            {
+                "index": index,
+                "id": entry_id,
+                "cidr": cidr,
+                "start": start,
+                "end": end,
+                "prefixlen": prefixlen,
+            }
+        )
+    return nodes
+
+
+def _find_duplicate_entries(
+    nodes: Sequence[dict],
+) -> tuple[list[dict], list[dict]]:
+    """在已解析节点中查找重复 id 与规范化后重复的网段。
+
+    返回 ``(duplicate_ids, duplicate_networks)``，结构与排序规则和
+    :class:`HierarchyInputError` 的对应字段一致。
+    """
+    by_id: dict[object, list[int]] = defaultdict(list)
+    by_network: dict[tuple[int, int], list[int]] = defaultdict(list)
+    for position, node in enumerate(nodes):
+        by_id[node["id"]].append(position)
+        by_network[(node["start"], node["end"])].append(position)
+
+    # by_id 按 id 首次出现的顺序插入，重复组天然按首次位置有序
+    duplicate_ids = [
+        {"id": nodes[indexes[0]]["id"], "indexes": indexes}
+        for indexes in by_id.values()
+        if len(indexes) > 1
+    ]
+
+    network_groups = [
+        indexes for indexes in by_network.values() if len(indexes) > 1
+    ]
+
+    def network_order(indexes: list[int]) -> tuple[int, int]:
+        return nodes[indexes[0]]["start"], nodes[indexes[0]]["end"]
+
+    duplicate_networks = [
+        {
+            "cidr": nodes[indexes[0]]["cidr"],
+            "entries": [
+                {"index": i, "id": nodes[i]["id"], "cidr": nodes[i]["cidr"]}
+                for i in indexes
+            ],
+        }
+        for indexes in sorted(network_groups, key=network_order)
+    ]
+    return duplicate_ids, duplicate_networks
+
+
+def _direct_parent_indexes(nodes: Sequence[dict]) -> list[int | None]:
+    """为每个节点选择前缀最长的严格超网作为唯一直接父节点。
+
+    返回与 ``nodes`` 等长的列表，每项为父节点在 ``nodes`` 中的位置或
+    ``None``（无严格超网）。调用前须保证无规范化后重复的网段，此时
+    “最长前缀严格超网”至多只有一个。
+    """
+    parents: list[int | None] = []
+    for position, node in enumerate(nodes):
+        parent_idx: int | None = None
+        parent_prefix = -1
+        for candidate_position, candidate in enumerate(nodes):
+            if (
+                candidate["start"] <= node["start"]
+                and candidate["end"] >= node["end"]
+                and candidate["prefixlen"] < node["prefixlen"]
+                and candidate["prefixlen"] > parent_prefix
+            ):
+                parent_prefix = candidate["prefixlen"]
+                parent_idx = candidate_position
+        parents.append(parent_idx)
+    return parents
 
 
 def build_cidr_hierarchy(
@@ -435,70 +556,12 @@ def build_cidr_hierarchy(
             f"条目数必须在 1..{HIERARCHY_MAX_ENTRIES} 之间，实际 {len(entries)}"
         )
 
-    nodes: list[dict] = []
-    by_id: dict[object, list[int]] = defaultdict(list)
-    by_network: dict[tuple[int, int], list[int]] = defaultdict(list)
-
-    for index, (raw_id, raw_cidr) in enumerate(entries):
-        entry_id = _validate_hierarchy_id(raw_id)
-        start, end, cidr = parse_cidr_v4(raw_cidr)
-        prefixlen = int(cidr.rsplit("/", 1)[1])
-        nodes.append(
-            {
-                "index": index,
-                "id": entry_id,
-                "cidr": cidr,
-                "start": start,
-                "end": end,
-                "prefixlen": prefixlen,
-            }
-        )
-        by_id[entry_id].append(index)
-        by_network[(start, end)].append(index)
-
-    # by_id 按 id 首次出现的顺序插入，重复组天然按首次位置有序
-    duplicate_ids = [
-        {"id": nodes[indexes[0]]["id"], "indexes": indexes}
-        for indexes in by_id.values()
-        if len(indexes) > 1
-    ]
-
-    network_groups = [
-        idxs for idxs in by_network.values() if len(idxs) > 1
-    ]
-
-    def network_order(idxs: list[int]) -> tuple[int, int]:
-        return nodes[idxs[0]]["start"], nodes[idxs[0]]["end"]
-
-    duplicate_networks = [
-        {
-            "cidr": nodes[indexes[0]]["cidr"],
-            "entries": [
-                {"index": i, "id": nodes[i]["id"], "cidr": nodes[i]["cidr"]}
-                for i in indexes
-            ],
-        }
-        for indexes in sorted(network_groups, key=network_order)
-    ]
+    nodes = _parse_entries(entries)
+    duplicate_ids, duplicate_networks = _find_duplicate_entries(nodes)
     if duplicate_ids or duplicate_networks:
         raise HierarchyInputError(duplicate_ids, duplicate_networks)
 
-    # 选择前缀最长的严格超网作为唯一 parent；同一网段的重复已在上面排除，
-    # 因此“最长前缀严格超网”至多只有一个。
-    parents: list[int | None] = []
-    for node in nodes:
-        parent_idx: int | None = None
-        parent_prefix = -1
-        for candidate in nodes:
-            if (
-                candidate["start"] <= node["start"]
-                and candidate["end"] >= node["end"]
-                and candidate["prefixlen"] < node["prefixlen"]
-            ):
-                if candidate["prefixlen"] > parent_prefix:
-                    parent_prefix = candidate["prefixlen"]
-                    parent_idx = candidate["index"]
-        parents.append(parent_idx)
+    parents = _direct_parent_indexes(nodes)
 
     children: dict[int | None, list[int]] = defaultdict(list)
     for index, parent_idx in enumerate(parents):
@@ -535,3 +598,181 @@ def build_cidr_hierarchy(
 
     roots = [build_node(i) for i in children.get(None, [])]
     return {"node_count": len(nodes), "root_count": len(roots), "roots": roots}
+
+
+# ---------- CIDR 清单差异（/cidrs/diff） ----------
+
+
+def diff_cidr_lists(
+    before: Sequence[tuple[object, str]],
+    after: Sequence[tuple[object, str]],
+) -> dict:
+    """比较两份带唯一 id 的 IPv4 CIDR 清单，报告条目级差异。
+
+    两侧各自要求 id 唯一且规范化后网段唯一（允许为空，每侧最多
+    ``DIFF_MAX_ENTRIES`` 条）；任一侧违反时抛出 :class:`DiffInputError`
+    （同时列出两侧各自的冲突），**不产生部分结果**。
+
+    按 id 匹配两侧条目并分类：
+
+    - 仅存在于 before → ``removed``；仅存在于 after → ``added``；
+      ``affected_addresses`` 取该网段地址数；
+    - 同 id 但规范化网段不同 → ``cidr_changed``，``affected_addresses``
+      取旧新网段的**对称差**地址数（相交部分不计）；
+    - 同 id 且网段相同、但**直接父节点**（各自清单内前缀最长的严格超网，
+      与 /cidrs/hierarchy 同一规则）不同 → ``parent_changed``，
+      网段本身未变，``affected_addresses`` 为 0；
+    - 其余同 id 条目为 ``unchanged``，不进入 ``changes``，仅计入汇总。
+
+    返回可直接 JSON 序列化的字典：``changes`` 保持 **before 输入顺序**，
+    新增项按 **after 输入顺序**追加；每项给出 ``id`` / ``change`` /
+    ``before_cidr`` / ``after_cidr`` / ``before_parent_id`` /
+    ``after_parent_id`` / ``affected_addresses``（新增项的 before 侧字段、
+    删除项的 after 侧字段为 None）。**规范化后网段相同但 id 不同**的条目
+    对列入 ``replacement_candidates``（按 before 输入顺序），每项含
+    ``before_id`` / ``after_id`` / ``cidr``。``summary`` 汇总五类条目数
+    （含 ``unchanged``）。全程基于整数区间运算，不逐地址枚举。
+    """
+    for side, entries in (("before", before), ("after", after)):
+        if not 0 <= len(entries) <= DIFF_MAX_ENTRIES:
+            raise ValueError(
+                f"{side} 侧条目数必须在 0～{DIFF_MAX_ENTRIES} 之间，"
+                f"实际 {len(entries)}"
+            )
+
+    parsed = {
+        "before": _parse_entries(before),
+        "after": _parse_entries(after),
+    }
+    # 先完整校验两侧唯一性，任一有问题即整体拒绝，不产生部分结果
+    problems: dict[str, dict] = {}
+    for side, nodes in parsed.items():
+        duplicate_ids, duplicate_networks = _find_duplicate_entries(nodes)
+        if duplicate_ids or duplicate_networks:
+            problems[side] = {
+                "duplicate_ids": duplicate_ids,
+                "duplicate_networks": duplicate_networks,
+            }
+    if problems:
+        raise DiffInputError(problems)
+
+    parents = {side: _direct_parent_indexes(nodes) for side, nodes in parsed.items()}
+
+    def parent_id(side: str, position: int) -> object:
+        parent_idx = parents[side][position]
+        return None if parent_idx is None else parsed[side][parent_idx]["id"]
+
+    before_nodes = parsed["before"]
+    after_nodes = parsed["after"]
+    after_positions = {node["id"]: i for i, node in enumerate(after_nodes)}
+    before_ids = {node["id"] for node in before_nodes}
+
+    changes: list[dict] = []
+    summary = {
+        ADDED: 0,
+        REMOVED: 0,
+        CIDR_CHANGED: 0,
+        PARENT_CHANGED: 0,
+        UNCHANGED: 0,
+    }
+
+    for position, node in enumerate(before_nodes):
+        before_parent = parent_id("before", position)
+        other_position = after_positions.get(node["id"])
+        if other_position is None:
+            changes.append(
+                {
+                    "id": node["id"],
+                    "change": REMOVED,
+                    "before_cidr": node["cidr"],
+                    "after_cidr": None,
+                    "before_parent_id": before_parent,
+                    "after_parent_id": None,
+                    "affected_addresses": node["end"] - node["start"] + 1,
+                }
+            )
+            summary[REMOVED] += 1
+            continue
+
+        other = after_nodes[other_position]
+        after_parent = parent_id("after", other_position)
+        if other["cidr"] != node["cidr"]:
+            # 受影响地址数 = 旧新网段的对称差（相交部分两侧都有，不计）
+            overlap = max(
+                0,
+                min(node["end"], other["end"])
+                - max(node["start"], other["start"])
+                + 1,
+            )
+            affected = (
+                (node["end"] - node["start"] + 1)
+                + (other["end"] - other["start"] + 1)
+                - 2 * overlap
+            )
+            changes.append(
+                {
+                    "id": node["id"],
+                    "change": CIDR_CHANGED,
+                    "before_cidr": node["cidr"],
+                    "after_cidr": other["cidr"],
+                    "before_parent_id": before_parent,
+                    "after_parent_id": after_parent,
+                    "affected_addresses": affected,
+                }
+            )
+            summary[CIDR_CHANGED] += 1
+        elif before_parent != after_parent:
+            changes.append(
+                {
+                    "id": node["id"],
+                    "change": PARENT_CHANGED,
+                    "before_cidr": node["cidr"],
+                    "after_cidr": other["cidr"],
+                    "before_parent_id": before_parent,
+                    "after_parent_id": after_parent,
+                    "affected_addresses": 0,
+                }
+            )
+            summary[PARENT_CHANGED] += 1
+        else:
+            summary[UNCHANGED] += 1
+
+    for position, node in enumerate(after_nodes):
+        if node["id"] in before_ids:
+            continue
+        changes.append(
+            {
+                "id": node["id"],
+                "change": ADDED,
+                "before_cidr": None,
+                "after_cidr": node["cidr"],
+                "before_parent_id": None,
+                "after_parent_id": parent_id("after", position),
+                "affected_addresses": node["end"] - node["start"] + 1,
+            }
+        )
+        summary[ADDED] += 1
+
+    # 替换候选：规范化后网段相同但 id 不同（同一网段换了 id），按 before 顺序
+    after_by_network = {
+        (node["start"], node["end"]): node for node in after_nodes
+    }
+    replacement_candidates = [
+        {
+            "before_id": node["id"],
+            "after_id": other["id"],
+            "cidr": node["cidr"],
+        }
+        for node in before_nodes
+        if (other := after_by_network.get((node["start"], node["end"])))
+        is not None
+        and other["id"] != node["id"]
+    ]
+
+    return {
+        "before_count": len(before_nodes),
+        "after_count": len(after_nodes),
+        "changes": changes,
+        "replacement_candidates": replacement_candidates,
+        "summary": summary,
+    }

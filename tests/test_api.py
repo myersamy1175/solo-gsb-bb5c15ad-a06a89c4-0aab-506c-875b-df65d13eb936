@@ -509,6 +509,211 @@ def test_hierarchy_existing_endpoints_unchanged():
     assert resp.json()["rules"][0]["status"] == "full"
 
 
+# ---------- /cidrs/diff ----------
+
+def post_diff(before, after):
+    return client.post("/cidrs/diff", json={"before": before, "after": after})
+
+
+def test_diff_all_change_types_and_ordering():
+    resp = post_diff(
+        [
+            {"id": "net", "cidr": "10.0.0.0/8"},      # unchanged
+            {"id": "sub", "cidr": "10.1.0.0/16"},     # removed
+            {"id": "leaf", "cidr": "10.1.0.0/24"},    # parent_changed
+            {"id": "gone", "cidr": "192.168.0.0/16"}, # removed（替换候选）
+            {"id": "moved", "cidr": "172.16.0.0/16"}, # cidr_changed
+        ],
+        [
+            {"id": "net", "cidr": "10.0.0.0/8"},
+            {"id": "leaf", "cidr": "10.1.0.0/24"},
+            {"id": "moved", "cidr": "172.16.0.0/24"},
+            {"id": "fresh", "cidr": "8.8.8.0/24"},    # added
+            {"id": "alias", "cidr": "192.168.0.0/16"},# added（替换候选）
+        ],
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["before_count"] == 5
+    assert body["after_count"] == 5
+
+    changes = body["changes"]
+    # 保持 before 顺序，新增项按 after 顺序追加
+    assert [c["id"] for c in changes] == [
+        "sub", "leaf", "gone", "moved", "fresh", "alias",
+    ]
+    assert [c["change"] for c in changes] == [
+        "removed", "parent_changed", "removed", "cidr_changed", "added", "added",
+    ]
+
+    sub, leaf, gone, moved, fresh, _alias = changes
+    assert sub == {
+        "id": "sub",
+        "change": "removed",
+        "before_cidr": "10.1.0.0/16",
+        "after_cidr": None,
+        "before_parent_id": "net",
+        "after_parent_id": None,
+        "affected_addresses": 1 << 16,
+    }
+    # 网段未变、仅直接父节点变化：sub 删除后 leaf 的父节点变为 net
+    assert leaf["before_cidr"] == leaf["after_cidr"] == "10.1.0.0/24"
+    assert leaf["before_parent_id"] == "sub"
+    assert leaf["after_parent_id"] == "net"
+    assert leaf["affected_addresses"] == 0
+    # CIDR 变更：受影响地址数 = 旧新网段对称差
+    assert moved["before_cidr"] == "172.16.0.0/16"
+    assert moved["after_cidr"] == "172.16.0.0/24"
+    assert moved["affected_addresses"] == (1 << 16) - (1 << 8)
+    # 新增：before 侧字段为 null，受影响地址数取该网段地址数
+    assert fresh["before_cidr"] is None
+    assert fresh["before_parent_id"] is None
+    assert fresh["affected_addresses"] == 1 << 8
+
+    # 规范化后网段相同但 id 不同 -> 替换候选
+    assert body["replacement_candidates"] == [
+        {"before_id": "gone", "after_id": "alias", "cidr": "192.168.0.0/16"}
+    ]
+    assert body["summary"] == {
+        "added": 2,
+        "removed": 2,
+        "cidr_changed": 1,
+        "parent_changed": 1,
+        "unchanged": 1,
+    }
+
+
+def test_diff_empty_lists_and_normalization():
+    # 两侧皆空：合法，无变更
+    resp = post_diff([], [])
+    assert resp.status_code == 200
+    assert resp.json()["changes"] == []
+    assert resp.json()["summary"] == {
+        "added": 0,
+        "removed": 0,
+        "cidr_changed": 0,
+        "parent_changed": 0,
+        "unchanged": 0,
+    }
+
+    # CIDR 规范化（前导零前缀、纯 IP）与整数 id
+    resp = post_diff(
+        [{"id": 1, "cidr": "10.0.0.0/08"}, {"id": 2, "cidr": "8.8.8.8"}],
+        [{"id": 2, "cidr": "8.8.8.8/32"}, {"id": 3, "cidr": "10.0.0.0/8"}],
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["summary"]["unchanged"] == 1
+    assert body["changes"][0]["before_cidr"] == "10.0.0.0/8"
+    assert body["changes"][1]["after_cidr"] == "10.0.0.0/8"
+    assert body["replacement_candidates"] == [
+        {"before_id": 1, "after_id": 3, "cidr": "10.0.0.0/8"}
+    ]
+
+
+def test_diff_duplicate_id_422_lists_side():
+    resp = post_diff(
+        [{"id": "a", "cidr": "10.0.0.0/8"}, {"id": "a", "cidr": "11.0.0.0/8"}],
+        [{"id": "b", "cidr": "12.0.0.0/8"}],
+    )
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["error"] == "duplicate_entries"
+    assert detail["before"] == {
+        "duplicate_ids": [{"id": "a", "indexes": [0, 1]}],
+        "duplicate_networks": [],
+    }
+    assert "after" not in detail
+
+
+def test_diff_duplicate_network_422_lists_side():
+    resp = post_diff(
+        [{"id": "a", "cidr": "10.0.0.0/8"}],
+        [{"id": "b", "cidr": "10.0.0.0/8"}, {"id": "c", "cidr": "10.0.0.0/08"}],
+    )
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["error"] == "duplicate_entries"
+    assert "before" not in detail
+    assert detail["after"]["duplicate_ids"] == []
+    assert detail["after"]["duplicate_networks"] == [
+        {
+            "cidr": "10.0.0.0/8",
+            "entries": [
+                {"index": 0, "id": "b", "cidr": "10.0.0.0/8"},
+                {"index": 1, "id": "c", "cidr": "10.0.0.0/8"},
+            ],
+        }
+    ]
+
+
+def test_diff_both_sides_duplicates_reported_together():
+    # 两侧同时有问题：一次 422 全部列出，不产生部分结果
+    resp = post_diff(
+        [{"id": "x", "cidr": "10.0.0.0/8"}, {"id": "x", "cidr": "10.0.0.0/8"}],
+        [{"id": "y", "cidr": "11.0.0.0/8"}, {"id": "y", "cidr": "12.0.0.0/8"}],
+    )
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["before"]["duplicate_ids"] == [{"id": "x", "indexes": [0, 1]}]
+    assert len(detail["before"]["duplicate_networks"]) == 1
+    assert detail["after"]["duplicate_ids"] == [{"id": "y", "indexes": [0, 1]}]
+    assert detail["after"]["duplicate_networks"] == []
+
+
+def test_diff_validation_422():
+    one = [{"id": "a", "cidr": "10.0.0.0/8"}]
+
+    # 缺少 before / after、请求体为空
+    assert client.post("/cidrs/diff", json={}).status_code == 422
+    assert client.post("/cidrs/diff", json={"before": one}).status_code == 422
+    assert client.post("/cidrs/diff", json={"after": one}).status_code == 422
+
+    # 任一侧超过 500 条
+    too_many = [{"id": i, "cidr": f"1.0.{i // 256}.{i % 256}/32"} for i in range(501)]
+    assert post_diff(too_many, []).status_code == 422
+    assert post_diff([], too_many).status_code == 422
+
+    # 非法 CIDR / IPv6（沿用现有严格校验）
+    for bad in ["10.0.0.1/8", "10.0.0.0/33", "garbage", "2001:db8::/32", "::1"]:
+        assert post_diff([{"id": "a", "cidr": bad}], []).status_code == 422, bad
+        assert post_diff([], [{"id": "a", "cidr": bad}]).status_code == 422, bad
+
+    # 非法 id：bool / float / 对象 / 空字符串 / 缺字段
+    for bad_id in [True, 1.5, ["x"], {"k": 1}, "   "]:
+        assert post_diff(
+            [{"id": bad_id, "cidr": "10.0.0.0/8"}], []
+        ).status_code == 422, bad_id
+    assert post_diff([{"cidr": "10.0.0.0/8"}], []).status_code == 422
+    assert post_diff([{"id": "a"}], []).status_code == 422
+
+    # 字段类型错误
+    assert client.post(
+        "/cidrs/diff", json={"before": "x", "after": []}
+    ).status_code == 422
+
+
+def test_diff_max_500_entries_per_side_accepted():
+    entries = [
+        {"id": i, "cidr": f"1.0.{i // 256}.{i % 256}/32"} for i in range(500)
+    ]
+    resp = post_diff(entries, entries)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["before_count"] == 500
+    assert body["after_count"] == 500
+    assert body["changes"] == []
+    assert body["summary"]["unchanged"] == 500
+
+
+def test_diff_existing_endpoints_unchanged():
+    # 新接口不影响既有接口
+    assert client.get("/health").status_code == 200
+    resp = post_hierarchy([{"id": "a", "cidr": "10.0.0.0/8"}])
+    assert resp.status_code == 200
+    assert post_analyze([{"action": "allow", "cidr": "10.0.0.0/8"}]).status_code == 200
+
+
 # ---------- /routes/resolve ----------
 
 def post_resolve(routes, targets):

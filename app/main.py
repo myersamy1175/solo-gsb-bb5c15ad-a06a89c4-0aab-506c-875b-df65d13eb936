@@ -7,12 +7,15 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, StrictInt, StrictStr, field_validator
 
 from .analyzer import (
+    DIFF_MAX_ENTRIES,
     HIERARCHY_MAX_ENTRIES,
+    DiffInputError,
     HierarchyInputError,
     InvalidCIDRError,
     analyze_rules,
     build_cidr_hierarchy,
     compare_rule_sets,
+    diff_cidr_lists,
     explain_query,
     parse_cidr_v4,
 )
@@ -38,11 +41,13 @@ app = FastAPI(
         "也可通过 /compare 比较两组规则在整个 IPv4 空间上的最终判定是否等价，"
         "通过 /explain 解释一段地址空间由哪条规则或默认动作最终裁决，"
         "通过 /cidrs/hierarchy 分析一组 CIDR 的包含层级（森林）与独占地址，"
+        "通过 /cidrs/diff 比较两份带唯一 id 的 CIDR 清单（新增/删除/"
+        "CIDR 变更/直接父节点变化与替换候选），"
         "通过 /routes/resolve 对目标地址做最长前缀匹配、最低 metric 的"
         "等价多路径（ECMP）路由解析，或通过 /routes/failover 模拟一组下一跳"
         "失效后的路由切换影响（before/after/impact）。"
     ),
-    version="1.5.0",
+    version="1.6.0",
 )
 
 
@@ -266,6 +271,84 @@ class HierarchyResponse(BaseModel):
 
 
 HierarchyNode.model_rebuild()
+
+
+# ---------- /cidrs/diff ----------
+
+
+class CidrDiffRequest(BaseModel):
+    """差异分析请求：before / after 两份带唯一 id 的 CIDR 清单（各 0～500 条）。"""
+
+    before: list[CidrEntry] = Field(
+        ...,
+        max_length=DIFF_MAX_ENTRIES,
+        description="变更前条目列表（0～500 个），id 与规范化网段各自唯一，可为空",
+    )
+    after: list[CidrEntry] = Field(
+        ...,
+        max_length=DIFF_MAX_ENTRIES,
+        description="变更后条目列表（0～500 个），id 与规范化网段各自唯一，可为空",
+    )
+
+
+class CidrChange(BaseModel):
+    """单条变更：按 id 匹配后的新增 / 删除 / CIDR 变更 / 直接父节点变化。"""
+
+    id: EntryId = Field(..., description="条目 id")
+    change: Literal["added", "removed", "cidr_changed", "parent_changed"] = Field(
+        ..., description="变更分类"
+    )
+    before_cidr: str | None = Field(
+        ..., description="before 侧规范化 CIDR；新增项为 null"
+    )
+    after_cidr: str | None = Field(
+        ..., description="after 侧规范化 CIDR；删除项为 null"
+    )
+    before_parent_id: EntryId | None = Field(
+        ..., description="before 清单内的直接父节点 id（前缀最长的严格超网）；新增项或无父节点为 null"
+    )
+    after_parent_id: EntryId | None = Field(
+        ..., description="after 清单内的直接父节点 id；删除项或无父节点为 null"
+    )
+    affected_addresses: int = Field(
+        ...,
+        description=(
+            "受影响地址数：CIDR 变更取旧新网段的对称差，新增/删除取该网段地址数，"
+            "父节点变化为 0"
+        ),
+    )
+
+
+class ReplacementCandidate(BaseModel):
+    """替换候选：规范化后网段相同但 id 不同的条目对。"""
+
+    before_id: EntryId = Field(..., description="before 侧条目 id")
+    after_id: EntryId = Field(..., description="after 侧条目 id")
+    cidr: str = Field(..., description="两侧规范化后相同的 CIDR")
+
+
+class CidrDiffSummary(BaseModel):
+    added: int = Field(..., description="仅存在于 after 的条目数")
+    removed: int = Field(..., description="仅存在于 before 的条目数")
+    cidr_changed: int = Field(..., description="同 id 但规范化 CIDR 不同的条目数")
+    parent_changed: int = Field(
+        ..., description="同 id 同 CIDR 但直接父节点变化的条目数"
+    )
+    unchanged: int = Field(..., description="同 id 同 CIDR 且父节点不变的条目数")
+
+
+class CidrDiffResponse(BaseModel):
+    before_count: int = Field(..., description="before 清单条目数")
+    after_count: int = Field(..., description="after 清单条目数")
+    changes: list[CidrChange] = Field(
+        ...,
+        description="变更列表：保持 before 输入顺序，新增项按 after 输入顺序追加",
+    )
+    replacement_candidates: list[ReplacementCandidate] = Field(
+        ...,
+        description="规范化网段相同但 id 不同的条目对，按 before 输入顺序",
+    )
+    summary: CidrDiffSummary
 
 
 # ---------- /routes/resolve ----------
@@ -558,6 +641,44 @@ def cidr_hierarchy(request: HierarchyRequest) -> dict:
                 "duplicate_ids": exc.duplicate_ids,
                 "duplicate_networks": exc.duplicate_networks,
             },
+        ) from exc
+    except InvalidCIDRError:
+        # 正常情况下 pydantic 已在入口拦截，这里兜底转为 422
+        raise
+
+
+@app.post(
+    "/cidrs/diff",
+    response_model=CidrDiffResponse,
+    tags=["diff"],
+    summary="比较两份带唯一 id 的 IPv4 CIDR 清单的差异",
+)
+def cidr_diff(request: CidrDiffRequest) -> dict:
+    """按 id 匹配 ``before`` / ``after`` 两份清单并报告条目级差异。
+
+    - 仅存在于 before 的条目为 ``removed``，仅存在于 after 的为 ``added``；
+    - 同 id 但规范化 CIDR 不同为 ``cidr_changed``，``affected_addresses``
+      取旧新网段的**对称差**地址数；新增/删除取该网段地址数；
+    - 同 id 同 CIDR 但**直接父节点**（各自清单内前缀最长的严格超网，
+      与 /cidrs/hierarchy 同一规则）不同为 ``parent_changed``，
+      ``affected_addresses`` 为 0；
+    - **规范化后网段相同但 id 不同**的条目对列入
+      ``replacement_candidates``（按 before 输入顺序）；
+    - ``changes`` 保持 **before 输入顺序**，新增项按 **after 输入顺序**追加；
+    - 每侧 0～500 条；任一侧 **id 重复**或**规范化后网段重复**时返回
+      **422**（``detail.before`` / ``detail.after`` 分别列出该侧冲突），
+      不产生部分结果；CIDR 校验与其他接口完全一致。
+    """
+    try:
+        return diff_cidr_lists(
+            [(entry.id, entry.cidr) for entry in request.before],
+            [(entry.id, entry.cidr) for entry in request.after],
+        )
+    except DiffInputError as exc:
+        # 任一侧重复 id / 规范化后重复网段：422 并按侧列出冲突
+        raise HTTPException(
+            status_code=422,
+            detail={"error": "duplicate_entries", **exc.sides},
         ) from exc
     except InvalidCIDRError:
         # 正常情况下 pydantic 已在入口拦截，这里兜底转为 422
